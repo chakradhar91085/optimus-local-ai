@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local AI Assistant (M1)</title>
+    <style>
+        body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
+        #chat-box { height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; background-color: white; margin-bottom: 10px; }
+        .message { margin-bottom: 10px; padding: 10px; border-radius: 5px; white-space: pre-wrap; }
+        .user { background-color: #e3f2fd; text-align: right; }
+        .assistant { background-color: #f1f8e9; text-align: left; }
+        .system { color: #888; font-size: 0.9em; text-align: center; font-style: italic; }
+        #input-container { display: flex; }
+        #user-input { flex-grow: 1; padding: 10px; }
+        button { padding: 10px 20px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Local AI Assistant (Milestone 1)</h1>
+    <div id="chat-box"></div>
+    <div id="input-container">
+        <input type="text" id="user-input" placeholder="Ask something (e.g., 'What time is it?')" onkeypress="if(event.key === 'Enter') sendMessage()">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <script>
+        let messages = [
+            {"role": "system", "content": "You are a helpful local Windows AI assistant. You can call tools if needed. Always answer concisely."}
+        ];
+
+        function appendMessage(role, content) {
+            const box = document.getElementById('chat-box');
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+            div.textContent = content;
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('user-input');
+            const text = input.value.trim();
+            if (!text) return;
+            
+            input.value = '';
+            appendMessage('user', text);
+            
+            messages.push({"role": "user", "content": text});
+            
+            appendMessage('system', 'Agent is thinking...');
+            
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: messages })
+                });
+                
+                const data = await response.json();
+                
+                // Remove the "thinking..." message
+                const box = document.getElementById('chat-box');
+                box.removeChild(box.lastChild);
+                
+                const reply = data.response;
+                appendMessage('assistant', reply);
+                
+                messages.push({"role": "assistant", "content": reply});
+            } catch (err) {
+                console.error(err);
+                
+                const box = document.getElementById('chat-box');
+                box.removeChild(box.lastChild);
+                appendMessage('system', 'Error communicating with backend.');
+            }
+        }
+    </script>
+</body>
+</html>
