@@ -171,9 +171,8 @@ def main():
     assert "list_directory" in names
     assert "search_files" in names
     assert "read_text_file" in names
-    assert len(names) == 5, "Failed 25"
+    assert len(names) == 7, "Failed 25"
 
-    
     # 26. Junction escape test
     print("\n--- Testing Junction Escape ---")
     outside_dir = pathlib.Path(r"C:\Projects") / "escape_test_dir"
@@ -219,8 +218,9 @@ def main():
     except:
         pass
 
-    print("\nAll registry unit tests passed.")
 
+
+    print("\nAll registry unit tests passed.")
     print("Stopping server...")
     server.terminate()
     server.wait()
@@ -228,5 +228,158 @@ def main():
 
 if __name__ == "__main__":
     main()
+print("\n--- Testing RAG Engine (M3) ---")
 
+import sys
+import os
+import json
+import sqlite3
+import shutil
+import asyncio
+from pathlib import Path
+if "." not in sys.path: sys.path.append(".")
+import main
+from rag import RagIndex
+from tools import registry
+
+test_db_dir = Path("data/rag")
+test_db_dir.mkdir(parents=True, exist_ok=True)
+test_db_path = test_db_dir / "test_index_deterministic.db"
+try:
+    import sqlite3
+    with sqlite3.connect(test_db_path) as conn:
+        conn.execute("DELETE FROM document_chunks")
+except:
+    pass
+
+class FakeOllamaClient:
+    async def embed(self, model, input):
+        if isinstance(input, str): input = [input]
+        return {'embeddings': [[0.5] * 768 for _ in input]}
+    async def list(self):
+        class MockModels: models = []
+        return MockModels()
+
+fake_client = FakeOllamaClient()
+rag = RagIndex(str(test_db_path), client=fake_client)
+
+# Disable the model check in test using the fake client check bypass
+async def mock_check_model(): return True
+rag.check_model = mock_check_model
+
+async def run_rag_tests():
+    print('Starting run_rag_tests')
+    # 1. SYSTEM_PROMPT tests
+    print('1. checking sys_prompt'); assert hasattr(main, "SYSTEM_PROMPT"), "SYSTEM_PROMPT missing"
+    assert "I couldn't find enough evidence" in main.SYSTEM_PROMPT, "Grounding evidence instruction missing"
+    assert "Call update_index ONLY when the user explicitly asks" in main.SYSTEM_PROMPT, "Indexing rule missing"
+    assert 'messages.insert(0, {"role": "system"' in Path("main.py").read_text(), "System prompt insertion missing"
+    
+    # 2. Chunking logic
+    text = "P1\n\nP2\n\nP3"
+    print('2. chunking'); chunks = rag.chunk_text(text, target_size=5, overlap=2)
+    assert len(chunks) == 2, "Chunking logic failed"
+    text2 = "1234567890"
+    chunks2 = rag.chunk_text(text2, target_size=6, overlap=2)
+    assert "56" in chunks2[1], "Overlap logic failed"
+    assert len(rag.chunk_text("")) == 0
+    assert len(rag.chunk_text("short")) == 1
+    
+    # 3. DB & Cosine checks
+    print('3. db exists'); assert test_db_path.exists()
+    assert rag.cosine_similarity([1, 0], [1, 0, 0]) == 0.0, "Cosine dim check failed"
+    
+    # 4. Atomic indexing failure test
+    sandbox = Path("assistant_files")
+    sandbox.mkdir(exist_ok=True)
+    test_file = sandbox / "atomic_test.txt"
+    test_file.write_text("Hello World", encoding="utf-8")
+    
+    # Successful initial index
+    print('4. atomic test'); res = await rag.update_index(str(sandbox))
+    assert "files newly indexed" in res
+    
+    with sqlite3.connect(rag.db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM document_chunks WHERE filename='atomic_test.txt'").fetchone()[0]
+        assert count > 0
+        old_val = conn.execute("SELECT chunk_text FROM document_chunks WHERE filename='atomic_test.txt'").fetchone()[0]
+        assert "Hello World" in old_val
+    
+    # Fail halfway through embedding
+    test_file.write_text("Modified File", encoding="utf-8")
+    async def failing_embed(model, input):
+        if "Modified" in input[0]:
+            raise Exception("Simulated Fake Client Failure")
+        return await FakeOllamaClient().embed(model=model, input=input)
+    fake_client.embed = failing_embed
+    
+    try:
+        await rag.update_index(str(sandbox))
+    except Exception:
+        pass
+    
+    with sqlite3.connect(rag.db_path) as conn:
+        new_val = conn.execute("SELECT chunk_text FROM document_chunks WHERE filename='atomic_test.txt'").fetchone()[0]
+        assert "Hello World" in new_val, "Index corrupted by partial update"
+    
+    # Succeed completely
+    async def passing_embed(model, input):
+        return await FakeOllamaClient().embed(model=model, input=input)
+    fake_client.embed = passing_embed
+    await rag.update_index(str(sandbox))
+    
+    with sqlite3.connect(rag.db_path) as conn:
+        new_val2 = conn.execute("SELECT chunk_text FROM document_chunks WHERE filename='atomic_test.txt'").fetchone()[0]
+        assert "Modified File" in new_val2, "Index did not successfully atomically replace"
+    
+    # Dimension / count mismatch
+    test_file.write_text("Mismatch count", encoding="utf-8")
+    async def mismatch_embed1(model, input): return {'embeddings': []}
+    fake_client.embed = mismatch_embed1
+    await rag.update_index(str(sandbox))
+    with sqlite3.connect(rag.db_path) as conn:
+        res = conn.execute("SELECT chunk_text FROM document_chunks WHERE filename='atomic_test.txt'").fetchone()[0]
+        assert "Modified File" in res, "Index corrupted by embedding count mismatch"
+
+    test_file.write_text("Mismatch dim", encoding="utf-8")
+    async def mismatch_embed2(model, input): return {'embeddings': [[0.5]*767 for _ in input]}
+    fake_client.embed = mismatch_embed2
+    await rag.update_index(str(sandbox))
+    with sqlite3.connect(rag.db_path) as conn:
+        res = conn.execute("SELECT chunk_text FROM document_chunks WHERE filename='atomic_test.txt'").fetchone()[0]
+        assert "Modified File" in res, "Index corrupted by embedding dimension mismatch"
+    
+    # Cleanup
+    
+    # 5. Junction traversal test
+    print('5. junction test')
+    outside_dir = Path(r"C:\Projects") / "escape_rag_dir"
+    outside_dir.mkdir(exist_ok=True)
+    (outside_dir / "rag_secret.txt").write_text("Secret RAG data", encoding="utf-8")
+    
+    junc_path = sandbox / "rag_linked_dir"
+    try:
+        if not junc_path.exists():
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(junc_path), str(outside_dir)], capture_output=True, text=True)
+    except:
+        pass
+        
+    if junc_path.exists():
+        res = await rag.update_index(str(sandbox))
+        with sqlite3.connect(rag.db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM document_chunks WHERE chunk_text LIKE '%Secret RAG data%'").fetchone()[0]
+            assert count == 0, "RAG index traversed junction!"
+        os.rmdir(junc_path)
+    shutil.rmtree(outside_dir, ignore_errors=True)
+
+    test_file.unlink(missing_ok=True)
+    try:
+        with sqlite3.connect(test_db_path) as conn:
+            conn.execute("DELETE FROM document_chunks")
+    except:
+        pass
+    print("All M3 RAG Tests Passed.")
+
+asyncio.run(run_rag_tests())
+print("\nAll assertions passed.")
 

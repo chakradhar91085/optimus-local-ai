@@ -6,3 +6,6 @@ __pycache__/
 
 # assistant sandbox
 assistant_files/
+
+# internal data
+data/
