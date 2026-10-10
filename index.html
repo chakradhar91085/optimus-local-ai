@@ -1,9 +1,9 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Local AI Assistant (M1)</title>
+    <title>Local AI Assistant (M4)</title>
     <style>
         body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
         #chat-box { height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; background-color: white; margin-bottom: 10px; }
@@ -11,17 +11,22 @@
         .user { background-color: #e3f2fd; text-align: right; }
         .assistant { background-color: #f1f8e9; text-align: left; }
         .system { color: #888; font-size: 0.9em; text-align: center; font-style: italic; }
+        .approval-box { border: 2px solid #ff9800; background-color: #fff3e0; padding: 15px; border-radius: 5px; margin: 10px 0; text-align: left; }
+        .approval-box h3 { margin-top: 0; color: #e65100; }
+        .approval-content { font-family: monospace; background: #ffe0b2; padding: 10px; white-space: pre-wrap; overflow-x: auto; margin-bottom: 10px; }
+        .btn-approve { background-color: #4caf50; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; }
+        .btn-deny { background-color: #f44336; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
         #input-container { display: flex; }
         #user-input { flex-grow: 1; padding: 10px; }
         button { padding: 10px 20px; cursor: pointer; }
     </style>
 </head>
 <body>
-    <h1>Local AI Assistant (Milestone 1)</h1>
+    <h1>Local AI Assistant (Milestone 4 HITL)</h1>
     <div id="chat-box"></div>
     <div id="input-container">
-        <input type="text" id="user-input" placeholder="Ask something (e.g., 'What time is it?')" onkeypress="if(event.key === 'Enter') sendMessage()">
-        <button onclick="sendMessage()">Send</button>
+        <input type="text" id="user-input" placeholder="Ask something..." onkeypress="if(event.key === 'Enter') sendMessage()">
+        <button id="send-btn" onclick="sendMessage()">Send</button>
     </div>
 
     <script>
@@ -36,6 +41,93 @@
             div.textContent = content;
             box.appendChild(div);
             box.scrollTop = box.scrollHeight;
+            return div;
+        }
+
+        function appendApprovalBox(action) {
+            const box = document.getElementById('chat-box');
+            const div = document.createElement('div');
+            div.className = "approval-box";
+            div.id = `approval-${action.action_id}`;
+            
+            const h3 = document.createElement('h3');
+            h3.textContent = '⚠️ Action Approval Required';
+            div.appendChild(h3);
+            
+            const pTool = document.createElement('p');
+            const strongTool = document.createElement('strong');
+            strongTool.textContent = 'Tool: ';
+            pTool.appendChild(strongTool);
+            pTool.appendChild(document.createTextNode(action.tool_name));
+            div.appendChild(pTool);
+            
+            const pTarget = document.createElement('p');
+            const strongTarget = document.createElement('strong');
+            strongTarget.textContent = 'Target: ';
+            pTarget.appendChild(strongTarget);
+            pTarget.appendChild(document.createTextNode(action.relative_path));
+            div.appendChild(pTarget);
+            
+            const pSize = document.createElement('p');
+            const strongSize = document.createElement('strong');
+            strongSize.textContent = 'Size: ';
+            pSize.appendChild(strongSize);
+            pSize.appendChild(document.createTextNode(action.character_count + ' characters'));
+            div.appendChild(pSize);
+            
+            const divContent = document.createElement('div');
+            divContent.className = 'approval-content';
+            divContent.textContent = action.bounded_preview;
+            div.appendChild(divContent);
+            
+            const btnApprove = document.createElement('button');
+            btnApprove.className = 'btn-approve';
+            btnApprove.textContent = 'Approve';
+            btnApprove.onclick = () => resolveAction(action.action_id, 'approve');
+            div.appendChild(btnApprove);
+            
+            const btnDeny = document.createElement('button');
+            btnDeny.className = 'btn-deny';
+            btnDeny.textContent = 'Deny';
+            btnDeny.onclick = () => resolveAction(action.action_id, 'reject');
+            div.appendChild(btnDeny);
+            
+            box.appendChild(div);
+            box.scrollTop = box.scrollHeight;
+        }
+        
+        async function resolveAction(actionId, decision) {
+            const approvalDiv = document.getElementById(`approval-${actionId}`);
+            if (approvalDiv) {
+                approvalDiv.textContent = "";
+                let p = document.createElement("p");
+                p.style.color = "#666";
+                let em = document.createElement("em");
+                em.textContent = `Action ${decision}d. Resuming agent...`;
+                p.appendChild(em);
+                approvalDiv.appendChild(p);
+            }
+            
+            try {
+                const response = await fetch(`/api/action/${decision}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action_id: actionId })
+                });
+                const data = await response.json();
+                
+                if (data.status === "APPROVAL_REQUIRED") {
+                    appendApprovalBox(data.action);
+                } else if (data.result) {
+                    appendMessage('assistant', data.result);
+                    messages.push({"role": "assistant", "content": data.result});
+                } else {
+                    appendMessage('system', 'Action completed, but no response was returned.');
+                }
+            } catch (err) {
+                console.error(err);
+                appendMessage('system', 'Error communicating with backend during resolution.');
+            }
         }
 
         async function sendMessage() {
@@ -48,7 +140,7 @@
             
             messages.push({"role": "user", "content": text});
             
-            appendMessage('system', 'Agent is thinking...');
+            const sysMsg = appendMessage('system', 'Agent is thinking...');
             
             try {
                 const response = await fetch('/chat', {
@@ -60,18 +152,18 @@
                 const data = await response.json();
                 
                 // Remove the "thinking..." message
-                const box = document.getElementById('chat-box');
-                box.removeChild(box.lastChild);
+                sysMsg.remove();
                 
-                const reply = data.response;
-                appendMessage('assistant', reply);
-                
-                messages.push({"role": "assistant", "content": reply});
+                if (data.status === "APPROVAL_REQUIRED") {
+                    appendApprovalBox(data.action);
+                } else {
+                    const reply = data.response;
+                    appendMessage('assistant', reply);
+                    messages.push({"role": "assistant", "content": reply});
+                }
             } catch (err) {
                 console.error(err);
-                
-                const box = document.getElementById('chat-box');
-                box.removeChild(box.lastChild);
+                sysMsg.remove();
                 appendMessage('system', 'Error communicating with backend.');
             }
         }
