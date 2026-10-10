@@ -190,3 +190,35 @@ def read_text_file(path: str) -> str:
         return text
     except Exception as e:
         return str(e)
+
+
+import asyncio
+from pydantic import BaseModel, ConfigDict
+from rag import RagIndex
+
+DB_PATH = r"C:\Projects\local_ai_assistant\data\rag\index.db"
+rag_index = RagIndex(DB_PATH)
+SANDBOX = r"C:\Projects\local_ai_assistant\assistant_files"
+
+class UpdateIndexArgs(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+@registry.register(
+    description="Updates the internal document index by scanning assistant_files. Call this ONLY when explicitly asked to index, refresh, update, or process documents.", 
+    args_model=UpdateIndexArgs,
+    permission="INTERNAL_MAINTENANCE"
+)
+def update_index() -> str:
+    return asyncio.run(rag_index.update_index(SANDBOX))
+
+class SearchDocumentsArgs(BaseModel):
+    query: str
+    model_config = ConfigDict(extra='forbid')
+
+@registry.register(
+    description="Semantically searches the indexed documents for relevant information. Use this to answer questions about the user's documents.", 
+    args_model=SearchDocumentsArgs,
+    permission="READ"
+)
+def search_documents(query: str) -> str:
+    return asyncio.run(rag_index.search(query))
