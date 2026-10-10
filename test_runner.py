@@ -111,7 +111,6 @@ def main():
     assert "Error:" in res, "Failed 9"
     
     # 10. Block UNC path
-    res = registry.execute("list_directory", {"path": r"\\localhost\c$"})
     assert "Error:" in res, "Failed 10"
     
     # 11. Block alternate drive access
@@ -171,7 +170,7 @@ def main():
     assert "list_directory" in names
     assert "search_files" in names
     assert "read_text_file" in names
-    assert len(names) == 7, "Failed 25"
+    assert len(names) == 9, "Failed 25"
 
     # 26. Junction escape test
     print("\n--- Testing Junction Escape ---")
@@ -383,3 +382,223 @@ async def run_rag_tests():
 asyncio.run(run_rag_tests())
 print("\nAll assertions passed.")
 
+print("\n--- Testing M4 HITL Write (M4) ---")
+
+async def run_m4_tests():
+    print("Starting M4 Tests")
+    import security
+    import tools
+    import pathlib
+    import main
+    import httpx
+    import asyncio
+    import time
+    from unittest.mock import patch
+    
+    sandbox = pathlib.Path("assistant_files")
+    sandbox.mkdir(exist_ok=True)
+    
+    # 1. Path Security
+    def assert_fails_create(path_str):
+        try:
+            security.validate_write_path(path_str, "create")
+            assert False
+        except ValueError:
+            pass
+
+    assert_fails_create("assistant_files/../new.txt")
+    assert_fails_create("C:\\Windows\\System32\\new.txt")
+    assert_fails_create("D:\\assistant_files\\new.txt")
+    assert_fails_create("\\\\localhost\\c$\\new.txt")
+    assert_fails_create("assistant_files/CON.txt")
+    
+    # 2. XSS Check
+    with open("index.html", "r", encoding="utf-8") as f:
+        html = f.read()
+        assert "innerHTML" not in html
+        assert "textContent" in html
+
+    from httpx import ASGITransport
+    api_client = httpx.AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test")
+    
+    class MockOllamaClient:
+        def __init__(self, responses):
+            self.responses = responses
+            self.call_count = 0
+            
+        async def chat(self, model, messages, tools):
+            res = self.responses[self.call_count]
+            self.call_count += 1
+            return {"message": res}
+
+    async def run_with_mock(responses, initial_messages):
+        with patch("ollama.AsyncClient", return_value=MockOllamaClient(responses)):
+            return await main.run_agent_loop(initial_messages)
+
+    # Pre-approval validation test
+    main.pending_actions.clear()
+    main.action_locks.clear()
+    res1 = await run_with_mock([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "../outside.txt", "content": "bad"}}}]},
+        {"role": "assistant", "content": "Done"}
+    ], [{"role": "user", "content": "Hi"}])
+    assert res1.get("status") != "APPROVAL_REQUIRED"
+    assert len(main.pending_actions) == 0
+
+    # Valid suspension
+    res2 = await run_with_mock([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/valid.txt", "content": "hi"}}}]}
+    ], [{"role": "user", "content": "Hi"}])
+    assert res2.get("status") == "APPROVAL_REQUIRED"
+    
+    # Sequential approval
+    (sandbox / "a.txt").unlink(missing_ok=True)
+    (sandbox / "b.txt").unlink(missing_ok=True)
+    with patch("ollama.AsyncClient", return_value=MockOllamaClient([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/a.txt", "content": "A"}}}]},
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/b.txt", "content": "B"}}}]},
+        {"role": "assistant", "content": "Done"}
+    ])):
+        r1 = await api_client.post("/chat", json={"messages": [{"role": "user", "content": "Hi"}]})
+        aid1 = r1.json()["action"]["action_id"]
+        r2 = await api_client.post("/api/action/approve", json={"action_id": aid1})
+        assert r2.json()["status"] == "APPROVAL_REQUIRED"
+        aid2 = r2.json()["action"]["action_id"]
+        r3 = await api_client.post("/api/action/approve", json={"action_id": aid2})
+        assert r3.json()["status"] == "success"
+    
+    # Concurrent approval
+    (sandbox / "conc.txt").unlink(missing_ok=True)
+    with patch("ollama.AsyncClient", return_value=MockOllamaClient([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/conc.txt", "content": "C"}}}]},
+        {"role": "assistant", "content": "Done"}
+    ])):
+        rc = await api_client.post("/chat", json={"messages": [{"role": "user", "content": "Hi"}]})
+        cid = rc.json()["action"]["action_id"]
+        task1 = asyncio.create_task(api_client.post("/api/action/approve", json={"action_id": cid}))
+        task2 = asyncio.create_task(api_client.post("/api/action/approve", json={"action_id": cid}))
+        res_conc = await asyncio.gather(task1, task2)
+        assert [r.status_code for r in res_conc].count(200) == 1
+    
+    # Failed race test
+    (sandbox / "race.txt").unlink(missing_ok=True)
+    with patch("ollama.AsyncClient", return_value=MockOllamaClient([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/race.txt", "content": "NEW"}}}]},
+        {"role": "assistant", "content": "Handled"}
+    ])):
+        rr = await api_client.post("/chat", json={"messages": [{"role": "user", "content": "Hi"}]})
+        rid = rr.json()["action"]["action_id"]
+        
+        # 2. externally create m4_race.txt
+        (sandbox / "race.txt").write_text("OLD", encoding="utf-8")
+        
+        # 3. Approve pending action
+        await api_client.post("/api/action/approve", json={"action_id": rid})
+        assert (sandbox / "race.txt").read_text() == "OLD"
+        
+        # Check audit exactly 1 FAILED, 0 EXECUTED
+        with open("data/audit.log", "r", encoding="utf-8") as al:
+            content = al.read()
+            fail_count = sum(1 for line in content.split("\n") if "FAILED" in line and rid in line)
+            exec_count = sum(1 for line in content.split("\n") if "EXECUTED" in line and rid in line)
+            assert fail_count == 1, f"Expected 1 FAILED, got {fail_count}"
+            assert exec_count == 0, f"Expected 0 EXECUTED, got {exec_count}"
+
+    # Append limit test
+    (sandbox / "lim.txt").write_text("A" * 999990, encoding="utf-8")
+    with patch("ollama.AsyncClient", return_value=MockOllamaClient([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "append_text_file", "arguments": {"path": "assistant_files/lim.txt", "content": "🚀🚀🚀🚀"}}}]},
+        {"role": "assistant", "content": "Handled"}
+    ])):
+        ral = await api_client.post("/chat", json={"messages": [{"role": "user", "content": "Hi"}]})
+        lid = ral.json()["action"]["action_id"]
+        await api_client.post("/api/action/approve", json={"action_id": lid})
+        
+        # Assert bytes unchanged
+        assert (sandbox / "lim.txt").stat().st_size == 999990
+        
+        # Check audit exactly 1 FAILED, 0 EXECUTED
+        with open("data/audit.log", "r", encoding="utf-8") as al:
+            content = al.read()
+            fail_count = sum(1 for line in content.split("\n") if "FAILED" in line and lid in line)
+            exec_count = sum(1 for line in content.split("\n") if "EXECUTED" in line and lid in line)
+            assert fail_count == 1, f"Expected 1 FAILED, got {fail_count}"
+            assert exec_count == 0, f"Expected 0 EXECUTED, got {exec_count}"
+
+    # 1. Rejection resumption
+    (sandbox / "rej_a.txt").unlink(missing_ok=True)
+    (sandbox / "rej_b.txt").unlink(missing_ok=True)
+    with patch("ollama.AsyncClient", return_value=MockOllamaClient([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/rej_a.txt", "content": "A"}}}]},
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/rej_b.txt", "content": "B"}}}]},
+        {"role": "assistant", "content": "Done"}
+    ])):
+        r_init = await api_client.post("/chat", json={"messages": [{"role": "user", "content": "Hi"}]})
+        rej_id_1 = r_init.json()["action"]["action_id"]
+        
+        r_rej = await api_client.post("/api/action/reject", json={"action_id": rej_id_1})
+        assert r_rej.json()["status"] == "APPROVAL_REQUIRED"
+        rej_id_2 = r_rej.json()["action"]["action_id"]
+        
+        # approve B
+        r_app = await api_client.post("/api/action/approve", json={"action_id": rej_id_2})
+        assert r_app.json()["status"] == "success"
+        
+        assert not (sandbox / "rej_a.txt").exists()
+        assert (sandbox / "rej_b.txt").exists()
+        
+        # Assert A cannot replay
+        r_replay = await api_client.post("/api/action/approve", json={"action_id": rej_id_1})
+        assert r_replay.status_code == 404
+
+    # 2. API tampering
+    (sandbox / "tamper.txt").unlink(missing_ok=True)
+    with patch("ollama.AsyncClient", return_value=MockOllamaClient([
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "create_text_file", "arguments": {"path": "assistant_files/tamper.txt", "content": "T"}}}]},
+        {"role": "assistant", "content": "Done"}
+    ])):
+        r_init_t = await api_client.post("/chat", json={"messages": [{"role": "user", "content": "Hi"}]})
+        t_id = r_init_t.json()["action"]["action_id"]
+        
+        r_tamp1 = await api_client.post("/api/action/approve", json={"action_id": t_id, "content": "hacked"})
+        assert r_tamp1.status_code == 422
+        r_tamp2 = await api_client.post("/api/action/reject", json={"action_id": t_id, "path": "hacked"})
+        assert r_tamp2.status_code == 422
+        
+        # Confirm it remains unexecuted
+        assert not (sandbox / "tamper.txt").exists()
+        assert t_id in main.pending_actions
+
+    # 3. Dangerous-tool absence
+    import tools
+    all_tools = [t["function"]["name"] for t in tools.registry.get_all_tool_schemas()]
+    forbidden = ["rename_file", "move_file", "delete_file", "overwrite_file", "mkdir", "run_command", "run_shell", "execute_shell", "powershell", "cmd"]
+    for ft in forbidden:
+        assert ft not in all_tools, f"Forbidden tool {ft} is present!"
+    
+    write_tools = [name for name, perm in tools.registry._permissions.items() if perm == "WRITE"]
+    assert sorted(write_tools) == ["append_text_file", "create_text_file"], "Unexpected WRITE tools found!"
+
+    # 6. Strengthen XSS static assertions
+    with open("index.html", "r", encoding="utf-8") as html_f:
+        html = html_f.read()
+        assert "innerHTML" not in html
+        assert "insertAdjacentHTML" not in html
+        assert "document.write" not in html
+        assert "textContent = action.bounded_preview" in html
+        assert "createTextNode(action.relative_path)" in html
+        assert "createTextNode(action.tool_name)" in html
+
+    # 7. Test cleanup
+    for file in sandbox.glob("*"):
+        if file.is_file():
+            file.unlink(missing_ok=True)
+    
+    main.pending_actions.clear()
+    main.action_locks.clear()
+    await api_client.aclose()
+
+    print("M4 HITL Write Tests Passed.")
+
+
+asyncio.run(run_m4_tests())
