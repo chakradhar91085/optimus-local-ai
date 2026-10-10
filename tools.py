@@ -12,12 +12,14 @@ class ToolRegistry:
         self._tools: Dict[str, dict] = {}
         self._functions: Dict[str, Callable] = {}
         self._models: Dict[str, Type[BaseModel]] = {}
+        self._permissions: Dict[str, str] = {}
 
     def register(self, description: str, args_model: Type[BaseModel], permission: str = "READ"):
         def decorator(func: Callable):
             name = func.__name__
             self._functions[name] = func
             self._models[name] = args_model
+            self._permissions[name] = permission
             
             schema = args_model.model_json_schema()
             
@@ -35,6 +37,14 @@ class ToolRegistry:
             }
             return func
         return decorator
+
+    def get_permission(self, name: str) -> str:
+        return self._permissions.get(name, "READ")
+
+    def validate_args(self, name: str, kwargs: dict) -> dict:
+        if name not in self._models:
+            raise ValueError(f"Unknown tool {name}")
+        return self._models[name](**kwargs).model_dump()
 
     def get_all_tool_schemas(self) -> List[dict]:
         return list(self._tools.values())
@@ -56,7 +66,7 @@ class ToolRegistry:
         except ValidationError as e:
             return f"Error: Invalid arguments for tool '{name}'. Details: {str(e)}"
         except Exception as e:
-            return f"Error executing tool '{name}': {str(e)}"
+            raise e
 
 registry = ToolRegistry()
 
@@ -196,6 +206,7 @@ import asyncio
 from pydantic import BaseModel, ConfigDict
 from rag import RagIndex
 
+
 DB_PATH = r"C:\Projects\local_ai_assistant\data\rag\index.db"
 rag_index = RagIndex(DB_PATH)
 SANDBOX = r"C:\Projects\local_ai_assistant\assistant_files"
@@ -222,3 +233,57 @@ class SearchDocumentsArgs(BaseModel):
 )
 def search_documents(query: str) -> str:
     return asyncio.run(rag_index.search(query))
+import os
+import asyncio
+from pydantic import BaseModel, ConfigDict
+from pydantic import Field
+from rag import RagIndex
+from security import validate_path, validate_write_path, MAX_WRITE_CONTENT, MAX_WRITABLE_FILE_SIZE
+
+
+
+class CreateTextFileArgs(BaseModel):
+    path: str
+    content: str = Field(..., max_length=MAX_WRITE_CONTENT)
+    model_config = ConfigDict(extra='forbid')
+
+@registry.register(
+    description="Creates a new text file. Fails if the file already exists.",
+    args_model=CreateTextFileArgs,
+    permission="WRITE"
+)
+def create_text_file(path: str, content: str) -> str:
+    if len(content) > MAX_WRITE_CONTENT:
+        raise ValueError(f"Error: Content exceeds maximum limit of {MAX_WRITE_CONTENT} characters.")
+    target_path = validate_write_path(path, operation="create")
+    try:
+        with open(target_path, "x", encoding="utf-8") as f:
+            f.write(content)
+    except FileExistsError:
+        raise FileExistsError("Error: File already exists. Cannot overwrite.")
+    return "File created successfully."
+
+class AppendTextFileArgs(BaseModel):
+    path: str
+    content: str = Field(..., max_length=MAX_WRITE_CONTENT)
+    model_config = ConfigDict(extra='forbid')
+
+@registry.register(
+    description="Appends text to an existing file. Fails if the file does not exist.",
+    args_model=AppendTextFileArgs,
+    permission="WRITE"
+)
+def append_text_file(path: str, content: str) -> str:
+    if len(content) > MAX_WRITE_CONTENT:
+        raise ValueError(f"Error: Content exceeds maximum limit of {MAX_WRITE_CONTENT} characters.")
+    target_path = validate_write_path(path, operation="append")
+    
+    current_size = target_path.stat().st_size
+    append_size = len(content.encode("utf-8"))
+    if current_size + append_size > MAX_WRITABLE_FILE_SIZE:
+        raise ValueError(f"Error: File size would exceed maximum limit of {MAX_WRITABLE_FILE_SIZE} bytes.")
+        
+    with open(target_path, "a", encoding="utf-8") as f:
+        f.write(content)
+    return "Content appended successfully."
+
